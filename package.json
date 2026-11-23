@@ -1,0 +1,13 @@
+{
+  "name": "dsh-plugin-git-graph",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Browse the Git commit graph of the current DSH session.",
+  "engines": { "dsh": "0.2.2-rc.5" },
+  "peerDependencies": { "@deepseek-ai/dsh-typert-protocol": "0.2.2-rc.5" },
+  "scripts": { "test": "node --test test/*.test.cjs", "check": "node --check index.js && node --check git.cjs && node --check client.js && npm test" },
+  "exports": { ".": "./index.js", "./client": "./client.js", "./locale/*.json": "./locale/*.json", "./icon": "./icon.svg" },
+  "files": ["index.js", "git.cjs", "client.js", "cordis.patch.yml", "locale/*.json", "icon.svg", "README.md"],
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" }, "client": { "platform": "web", "immediately": true, "inject": ["@deepseek-ai/dsh-client-ui-sidebar-right", "@deepseek-ai/dsh-client-connection", "@deepseek-ai/dsh-client-locale"] } }
+}
