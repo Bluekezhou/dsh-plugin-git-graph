@@ -2,7 +2,8 @@
 const { execFile } = require('node:child_process');
 const { isUtf8 } = require('node:buffer');
 const { basename, isAbsolute, join } = require('node:path');
-const { stat } = require('node:fs/promises');
+const { stat, open, realpath, opendir, lstat } = require('node:fs/promises');
+const { constants: fsFlags } = require('node:fs');
 const { promisify } = require('node:util');
 const exec = promisify(execFile);
 const { createHash, createHmac, randomBytes, timingSafeEqual } = require('node:crypto');
@@ -261,4 +262,163 @@ async function readPage(cwd, cursor, signal, sessionId) {
   if (signal?.aborted) throw new Error('Git history was cancelled.');
   return result;
 }
-module.exports = { history, historyPage, files };
+const WORK_LIMIT = 256 * 1024;
+const workResult = (kind, text = '', truncated = false) => ({ kind, text, truncated });
+
+async function workTree(cwd, signal, sessionId, expectedRoot) {
+  const discover = gitReader(cwd, signal);
+  if ((await discover(['rev-parse', '--is-inside-work-tree'], { probe: true }))?.trim() !== 'true') return null;
+  const root = await realpath((await discover(['rev-parse', '--show-toplevel'])).replace(/\n$/, ''));
+  if (expectedRoot && expectedRoot !== root) return null;
+  const run = gitReader(root, signal);
+  // Worktree status/diff can run clean filters merely by comparing index entries.
+  // Neutralize each configured clean/process driver, including definitions in includes.
+  const opts = ['--literal-pathspecs', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false',
+    '-c', 'core.hooksPath=' + (process.platform === 'win32' ? 'NUL' : '/dev/null'), '-c', 'core.bigFileThreshold=16m'];
+  const keys = await run(['config', '--includes', '--null', '--name-only', '--get-regexp', '^filter\\..*\\.(clean|process|required)$'], { empty: true, bytes: 64 * 1024 });
+  for (const key of new Set(keys.split('\0').filter(Boolean))) opts.push('-c', key + (key.endsWith('.required') ? '=false' : '='));
+  const git = (args, options) => run([...opts, ...args], options);
+  const { stdout, truncated } = await git(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--find-renames', '--ignore-submodules=dirty'], { prefixOutput: true, bytes: 2 * 1024 * 1024 });
+  const rows = [];
+  let pos = 0;
+  function field() {
+    const end = stdout.indexOf(0, pos);
+    if (end === -1) return null;
+    const val = stdout.subarray(pos, end); pos = end + 1; return val;
+  }
+  while (pos < stdout.length && rows.length < 10000) {
+    const entry = field();
+    if (!entry && truncated) break;
+    if (!entry || entry.length < 4 || entry[2] !== 32) throw new Error('Invalid Git status record.');
+    const x = String.fromCharCode(entry[0]), y = String.fromCharCode(entry[1]);
+    const path = entry.subarray(3), paired = /[RC]/.test(x + y), old = paired && field();
+    if (paired && !old) { if (truncated) break; throw new Error('Invalid Git rename record.'); }
+    const id = createHmac('sha256', cursorKey).update(sessionId).update('\0').update(root).update('\0').update(entry).update('\0').update(old || '').digest('hex');
+    rows.push({ id, x, y, path: fileName(path), ...(old && { oldPath: fileName(old) }), usable: isUtf8(path) && (!old || isUtf8(old)) });
+  }
+  return { root, git, rows, truncated: truncated || pos < stdout.length };
+}
+
+// Only direct, non-symlink directories with a real .git directory/file qualify.
+// Do not traverse the workspace or substitute a path supplied by the client.
+async function children(cwd, signal, sessionId) {
+  const base = await realpath(cwd), repos = [];
+  let count = 0, truncated = false;
+  for await (const entry of await opendir(base)) {
+    signal?.throwIfAborted();
+    if (++count > 4096) { truncated = true; break; }
+    if (!entry.isDirectory() || entry.name === '.git') continue;
+    const root = join(base, entry.name);
+    try {
+      if ((await realpath(root)) !== root) continue;
+      const meta = await lstat(join(root, '.git'));
+      if (!meta.isDirectory() && !meta.isFile()) continue;
+    } catch (e) { if (e.code !== 'ENOENT' && e.code !== 'ENOTDIR') truncated = true; continue; }
+    if (repos.length >= 64) { truncated = true; break; }
+    const tag = createHmac('sha256', cursorKey).update(JSON.stringify([sessionId, base, root])).digest('hex').slice(0, 32);
+    repos.push({ root, name: entry.name, tag });
+  }
+  repos.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+  return { repos, truncated };
+}
+
+async function status(cwd, signal, sessionId = '') {
+  const tree = await workTree(cwd, signal, sessionId);
+  if (tree) return { status: 'ok', files: tree.rows.map(({ usable, ...row }) => row), truncated: tree.truncated };
+  const group = await children(cwd, signal, sessionId);
+  const result = { status: 'not-repo', files: [], truncated: group.truncated };
+  let repoCount = 0;
+  for (let i = 0; i < group.repos.length; i += 4) {
+    const batch = group.repos.slice(i, i + 4);
+    const trees = await Promise.all(batch.map(async repo => {
+      try { return await workTree(repo.root, signal, sessionId, repo.root); }
+      catch (error) { if (signal?.aborted) throw error; result.truncated = true; return null; }
+    }));
+    trees.forEach((child, j) => {
+      if (!child) return;
+      repoCount++;
+      const {name, tag} = batch[j]; result.truncated ||= child.truncated;
+      for (const { usable, oldPath, ...row } of child.rows) {
+        if (result.files.length === 10000) { result.truncated = true; break; }
+        result.files.push({ ...row, id: tag + row.id.slice(0, 32), path: name + '/' + row.path, ...(oldPath && {oldPath: name + '/' + oldPath}) });
+      }
+    });
+  }
+  return repoCount ? { ...result, status: 'ok', scope: 'children', repoCount } : result;
+}
+
+function safeParts(name) {
+  const parts = name.split('/');
+  return !isAbsolute(name) && parts.every(p => p && p !== '.' && p !== '..' && p.toLowerCase() !== '.git' &&
+    (process.platform !== 'win32' || !/[\\:]/.test(p))) ? parts : null;
+}
+
+function asText(kind, bytes, truncated) {
+  // A bounded prefix may end halfway through a valid UTF-8 character.
+  let end = bytes.length;
+  if (truncated) {
+    let lead = end - 1;
+    while (lead >= Math.max(0, end - 3) && (bytes[lead] & 0xc0) === 0x80) lead--;
+    if (lead >= 0 && bytes[lead] >= 0xc2 && end - lead < (bytes[lead] < 0xe0 ? 2 : bytes[lead] < 0xf0 ? 3 : 4)) end = lead;
+  }
+  bytes = bytes.subarray(0, end);
+  if (bytes.includes(0) || !isUtf8(bytes)) return workResult('binary');
+  return workResult(kind, bytes.toString('utf8'), truncated);
+}
+
+async function preview(root, parts, signal) {
+  // Walk pinned directory descriptors: a symlink inserted into an ancestor after
+  // status must never redirect a preview outside the tree. Fail closed if the OS
+  // lacks a usable descriptor filesystem. O_NONBLOCK also prevents FIFO hangs.
+  const dirFlags = fsFlags.O_RDONLY | fsFlags.O_DIRECTORY | fsFlags.O_NOFOLLOW;
+  if (!fsFlags.O_NOFOLLOW || !fsFlags.O_DIRECTORY) return workResult('unavailable');
+  const fdRoot = process.platform === 'linux' ? '/proc/self/fd' : '/dev/fd';
+  const handles = [];
+  try {
+    let dir = await open(root, dirFlags); handles.push(dir);
+    for (const [i, part] of parts.entries()) {
+      signal?.throwIfAborted();
+      const last = i === parts.length - 1;
+      const candidate = join(fdRoot, String(dir.fd), part);
+      if (last && !(await lstat(candidate)).isFile()) return workResult('unavailable');
+      const next = await open(candidate, last ? fsFlags.O_RDONLY | fsFlags.O_NOFOLLOW | fsFlags.O_NONBLOCK : dirFlags);
+      handles.push(next); dir = next;
+    }
+    if (!(await dir.stat()).isFile()) return workResult('unavailable');
+    const bytes = Buffer.alloc(WORK_LIMIT + 1);
+    const { bytesRead } = await dir.read(bytes, 0, bytes.length, 0);
+    signal?.throwIfAborted();
+    return asText('preview', bytes.subarray(0, Math.min(bytesRead, WORK_LIMIT)), bytesRead > WORK_LIMIT);
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    return workResult('unavailable');
+  } finally { await Promise.all(handles.map(h => h.close())); }
+}
+
+async function diff(cwd, id, side, signal, sessionId = '') {
+  if (typeof id !== 'string' || !/^[a-f0-9]{64}$/.test(id) || !['staged', 'unstaged', 'untracked'].includes(side)) throw new Error('Invalid worktree file request.');
+  let tree = await workTree(cwd, signal, sessionId);
+  let row = tree?.rows.find(r => r.id === id);
+  if (!tree) {
+    const { repos } = await children(cwd, signal, sessionId);
+    const repo = repos.find(r => id.startsWith(r.tag));
+    if (repo) {
+      tree = await workTree(repo.root, signal, sessionId, repo.root);
+      row = tree?.rows.find(r => repo.tag + r.id.slice(0, 32) === id);
+    }
+  }
+  if (!row) throw new Error('File status changed. Refresh the file list.');
+  const parts = safeParts(row.path);
+  if (!row.usable || !parts || (row.oldPath && !safeParts(row.oldPath))) return workResult('unavailable');
+  if (side === 'untracked' && row.x === '?' && row.y === '?') return preview(tree.root, parts, signal);
+  const state = side === 'staged' ? row.x : row.y;
+  if (side === 'untracked' || state === '?' || state === ' ') throw new Error('File does not have the requested change.');
+  const args = ['diff', '--no-ext-diff', '--no-textconv', '--no-color', '--no-relative', '--ignore-submodules=dirty', '--submodule=short',
+    '-O' + (process.platform === 'win32' ? 'NUL' : '/dev/null'), '--find-renames', ...(side === 'staged' ? ['--cached'] : []), '--', row.path];
+  if (row.oldPath && /[RC]/.test(state)) args.push(row.oldPath);
+  const { stdout, truncated } = await tree.git(args, { bytes: WORK_LIMIT, prefixOutput: true });
+  const result = asText('diff', stdout, truncated);
+  return /^Binary files .* differ$/m.test(result.text) ? workResult('binary') : result;
+}
+
+module.exports = { history, historyPage, files, status, diff };

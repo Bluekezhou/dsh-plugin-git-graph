@@ -7,7 +7,7 @@ export default class GitGraph extends TypertRemoteService {
   constructor(ctx) {
     super(ctx, 'gitGraph');
     // Apply the standard Remote decorator without requiring a decorator transpiler.
-    for (const name of ['history', 'historyPage', 'files']) {
+    for (const name of ['history', 'historyPage', 'files', 'status', 'diff']) {
       Remote(GitGraph.prototype[name], {
         kind: 'method', name, static: false, private: false,
         addInitializer: initialize => initialize.call(this),
@@ -27,6 +27,14 @@ export default class GitGraph extends TypertRemoteService {
 
   async files(session, oid, signal) {
     return this.readSession(session, 'files', cwd => git.files(cwd, oid, signal));
+  }
+
+  async status(session, signal) {
+    return this.readSession(session, 'status', cwd => git.status(cwd, signal, session.id));
+  }
+
+  async diff(session, id, side, signal) {
+    return this.readSession(session, 'diff', cwd => git.diff(cwd, id, side, signal, session.id));
   }
 
   async readSession(session, action, read) {

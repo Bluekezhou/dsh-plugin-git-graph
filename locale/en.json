@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Git commit graph",
+    "title": "DSH Git commit graph",
     "description": "Browse local history in the session sidebar, 200 commits at a time, with no fixed total limit. Branch labels and subjects follow each row’s colored graph lanes. Expand a commit to see changed files and renames. Read-only."
   }
 }
