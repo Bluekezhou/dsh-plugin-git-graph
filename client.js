@@ -308,13 +308,13 @@
           return ()=>{mounted=false;pager.stop();};
         },[pager]);
         useEffect(()=>actions.bindCommands({refresh:pager.refresh}),[actions,pager]);
-        const phaseRef=useRef(phase); phaseRef.current=phase;
-        useAutoRefresh(pager.refresh,()=>phaseRef.current==='loading'||phaseRef.current==='appending');
         useEffect(()=>{const el=pane.current;const measure=()=>setSize(el.clientWidth);measure();const ro=new ResizeObserver(measure);ro.observe(el);return ()=>ro.disconnect();},[]);
         useEffect(()=>{if(!feedback)return;const id=setTimeout(()=>setFeedback(null),2200);return ()=>clearTimeout(id);},[feedback]);
         useEffect(()=>()=>{attempt.current++;},[]);
         async function onCopy(oid){const i=++attempt.current;let ok=false;try{await navigator.clipboard.writeText(oid);ok=true;}catch{}if(i!==attempt.current)return;setFeedback({oid,ok});if(!ok)select(oid);}
         const {data,phase,cursor}=state, busy=phase==='loading', appending=phase==='appending', failed=phase==='refreshError', limit=size<=480?4:12,wide=size>=768;
+        const phaseRef=useRef(phase); phaseRef.current=phase;
+        useAutoRefresh(pager.refresh,()=>phaseRef.current==='loading'||phaseRef.current==='appending');
         const commits=useMemo(()=>visible(data?.commits || [],data?.merged,showMerged),[data,showMerged]);
         const rows=useMemo(()=>layout(commits,limit),[commits,limit]),hashes=useMemo(()=>new Set(commits.map(c=>c.hash)),[commits]);
         useEffect(()=>{if(selected && !hashes.has(selected)) select(null);},[selected,hashes]);
