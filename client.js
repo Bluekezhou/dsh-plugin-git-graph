@@ -88,15 +88,25 @@
   // React renders a disabled button; an RPC may settle even after it was aborted.
   function historyPager(sessionId, load, publish) {
     let state = {phase:'idle', data:null, cursor:null}, request = null, active = false;
+    let firstCursor = null;
     function update(next) { state = next; publish(next); }
     async function fetchPage(append, discard = false) {
-      if (!active || (append ? request || !state.cursor : request && state.phase === 'loading')) return;
+      if (!active || (append ? request || !state.cursor : request && state.phase !== 'appending')) return;
       request?.abort();
       const current = request = new AbortController(), cursor = append ? state.cursor : null;
-      update({phase:append ? 'appending' : 'loading', data:discard ? null : state.data, cursor});
+      // A routine refresh leaves the last settled view (including its pager) in place.
+      if (append || discard || !state.data || state.phase === 'appending')
+        update({phase:append ? 'appending' : 'loading', data:discard ? null : state.data, cursor});
       try {
         const page = await load(sessionId, cursor, current.signal);
         if (request !== current) return;
+        if (!append) {
+          const next = page.page?.nextCursor ?? null;
+          // The Host signs this cursor with the repository snapshot. Keep later
+          // pages and the reader's position when that snapshot hasn't changed.
+          if (next && next === firstCursor && state.phase === 'ready') return;
+          firstCursor = next;
+        }
         let data = page;
         if (append) {
           const seen = new Set(state.data.commits.map(c => c.hash));
@@ -112,7 +122,7 @@
       } catch (err) {
         if (request !== current) return;
         if (append && err?.code === 'git-graph/restart') return fetchPage(false, true);
-        update({...state, phase:append ? 'moreError' : 'refreshError', reason:String(err?.message || err)});
+        update({...state, cursor, phase:append ? 'moreError' : 'refreshError', reason:String(err?.message || err)});
       } finally { if (request === current) request = null; }
     }
     return {
@@ -344,13 +354,13 @@
           h('p',{ref:note,tabIndex:-1,className:'gg-note',role:'status'},status,total>0?` · ${t('source')} · ${t('auto')}`:` · ${t('auto')}`),
           h('span',{className:'gg-sr',role:'status'},feedback?t(feedback.ok?'copied':'manual'):''));
       }
-      // An expanded row owns its diff request; refreshing the listing remounts all rows.
-      function useWorkspaceRead(connection,method,args,version,quiet=false) {
+      // Callers are keyed by session/cwd and file/side. Keep their last result
+      // mounted while a newer read is in flight.
+      function useWorkspaceRead(connection,method,args,version,retry=0) {
         const [state,setState]=useState({phase:'loading'});
         useEffect(()=>{
           const controller=new AbortController();
-          // A quiet (automatic) re-read keeps the previous listing on screen.
-          setState(prev => quiet && prev.data ? prev : {phase:'loading'});
+          setState(prev => prev.data ? {...prev, pending:true} : {phase:'loading'});
           (async()=>{
             await Promise.resolve();
             if(controller.signal.aborted) return;
@@ -358,11 +368,11 @@
               const data=await workspaceRead(connection,method,args,controller.signal);
               if(!controller.signal.aborted) setState({phase:'ready',data});
             } catch(err) {
-              if(!controller.signal.aborted) setState({phase:'error',reason:String(err?.message || '')});
+              if(!controller.signal.aborted) setState(prev=>({phase:'error',data:prev.data,reason:String(err?.message || '')}));
             }
           })();
           return ()=>controller.abort();
-        },[connection,method,args,version,quiet]);
+        },[connection,method,args,version,retry]);
         return state;
       }
       function CodeDiff({data,label,t}) {
@@ -381,10 +391,10 @@
               h('div',{className:'gg-code-row '+r.kind,key:i},h('span',{className:'gg-num','aria-hidden':true},r.old),h('span',{className:'gg-num','aria-hidden':true},r.next),h('span',{className:'gg-sign'},r.mark),h('code',null,r.text)))):h('pre',null,data.text)),
           rich&&model.rows.length>limit&&h('button',{className:'gg-toggle',type:'button',onClick:()=>setLimit(n=>n+200)},t('moreLines')));
       }
-      function Patch({sessionId,entry,connection,t}) {
+      function Patch({sessionId,entry,connection,t,revision}) {
         const args=useMemo(()=>({sessionId,id:entry.file.id,side:entry.side}),[sessionId,entry.file.id,entry.side]);
         const [attempt,setAttempt]=useState(0);
-        const {phase,data,reason}=useWorkspaceRead(connection,'diff',args,attempt);
+        const {phase,data,reason}=useWorkspaceRead(connection,'diff',args,revision,attempt);
         return h('div',{className:'gg-patch'},
           phase==='loading' && h('span',{role:'status'},t('diffLoading')),
           phase==='error' && h('div',{role:'status'},t('diffError'),' ',reason,h('button',{type:'button',className:'gg-toggle',onClick:()=>setAttempt(i=>i+1)},t('retry'))),
@@ -394,28 +404,26 @@
       }
       function Workspace({sessionId,actions,connection,t}) {
         const panelId=React.useId();
-        const [revision,setRevision]=useState({n:0,manual:false}),[expanded,expand]=useState(null);
-        const refresh=useMemo(()=>()=>{expand(null);setRevision(s=>({n:s.n+1,manual:true}));},[]);
+        const [revision,setRevision]=useState(0),[expanded,expand]=useState(null);
+        const refresh=useMemo(()=>()=>setRevision(n=>n+1),[]);
         useEffect(()=>actions.bindCommands({refresh}),[actions,refresh]);
         const args=useMemo(()=>({sessionId}),[sessionId]);
-        const {data,phase,reason}=useWorkspaceRead(connection,'status',args,revision,!revision.manual);
-        const phaseRef=useRef(phase); phaseRef.current=phase;
-        // Automatic re-reads keep the expanded file open; its diff request is keyed by content.
-        useAutoRefresh(useMemo(()=>()=>setRevision(s=>({n:s.n+1,manual:false})),[]),()=>phaseRef.current==='loading');
+        const {data,phase,reason,pending}=useWorkspaceRead(connection,'status',args,revision);
+        useAutoRefresh(refresh,()=>phase==='loading' || pending);
         const groups=useMemo(()=>workspaceGroups(data?.files || []),[data]);
         const path=p=>h('bdi',{dir:'ltr',translate:'no'},displayPath(p));
         const message=phase==='loading'?t('statusLoading'):phase==='error'?`${t('statusError')} ${reason}`:data.status==='not-repo'?t('workspaceOutside'):data.files.length?t('fileCount',{n:data.files.length}):!data.truncated?t('clean'):'';
         return h('section',{className:'gg-view gg-ws','aria-label':t('workspace')},h('style',null,style),
           h('header',{className:'gg-bar'},h('h2',null,t('workspace')),h('span',{className:'gg-context'},data?.scope==='children'?t('childScope',{n:data.repoCount}):''),h('button',{type:'button',onClick:refresh,disabled:phase==='loading'},t(phase==='error'?'retry':'refresh'))),
           h('div',{className:'gg-note',role:'status'},message,data?.truncated && ' '+t('partialStatus'),message && ' · ',t('auto')),
-          h('div',{className:'gg-scroll','aria-busy':phase==='loading'},Object.entries(groups).filter(([,entries])=>entries.length).map(([group,entries])=>h('section',{key:group},
+          h('div',{className:'gg-scroll','aria-busy':phase==='loading' || !!pending},Object.entries(groups).filter(([,entries])=>entries.length).map(([group,entries])=>h('section',{key:group},
             h('h3',null,t(group),' · ',entries.length),h('ul',null,entries.map(entry=>{
               const {file,status}=entry,key=JSON.stringify([entry.side,file.id]),open=key===expanded;
               const label=['A','M','D','R','T','C'].includes(status)?t('file'+status):t(group);
               return h('li',{key},h('button',{type:'button',className:'gg-ws-entry','aria-expanded':open,'aria-controls':open?panelId:undefined,onClick:()=>expand(open?null:key)},
                 h('span',{'aria-hidden':true},open?'▾':'▸'),h('span',{className:'gg-ws-status',title:label,'aria-label':label},status),
                 h('code',{className:'gg-file-path'},file.oldPath!=null && ['R','C'].includes(status) && path(file.oldPath),file.oldPath!=null && ['R','C'].includes(status) && ' → ',path(file.path))),
-                open && h('div',{id:panelId},h(Patch,{key:revision,sessionId,entry,connection,t})));
+                open && h('div',{id:panelId},h(Patch,{revision,sessionId,entry,connection,t})));
             }))))));
       }
       function WorkspaceIcon({size=24}={}){return h('svg',{width:size,height:size,viewBox:'0 0 24 24',fill:'none',stroke:'currentColor',strokeWidth:1.7,strokeLinecap:'round',strokeLinejoin:'round','aria-hidden':true},h('path',{d:'M5 3h9l5 5v13H5zM14 3v5h5M8 12h6m-3-3v6m-3 3h6'}));}

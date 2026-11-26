@@ -90,6 +90,17 @@ test('explicit pages append to the same graph; retry keeps cursor, folding and a
   await pager.more(); assert.equal(calls.length,3);
 });
 
+test('refreshing an unchanged snapshot leaves the visible history and later pages in place', async()=>{
+  const {pager,calls,latest}=harness();
+  const start=pager.start(); calls[0].success(page([c('first')],'signed')); await start;
+  const more=pager.more(); calls[1].success(page([c('second')],'later')); await more;
+  const before=latest(), refresh=pager.refresh();
+  assert.equal(latest(),before);
+  await pager.more(); await pager.refresh(); assert.equal(calls.length,3);
+  calls[2].success(page([c('first')],'signed')); await refresh;
+  assert.equal(latest(),before);
+});
+
 test('a cached older host keeps its truncated first page visible without pretending it is the end', async()=>{
   const {pager,calls,latest}=harness();
   const start=pager.start(); calls[0].success({status:'ok',commits:[c('cached')],truncated:true}); await start;
