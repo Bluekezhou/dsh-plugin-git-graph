@@ -10,8 +10,10 @@ function harness({visible=true,busy=false,ms=10000}={}) {
     addEventListener(type,fn){listeners.set(type,[...(listeners.get(type)||[]),fn]);},
     removeEventListener(type,fn){listeners.set(type,(listeners.get(type)||[]).filter(f=>f!==fn));},
   };
+  // Like window.setInterval: a receiver other than undefined/global throws.
+  function native(fn,delay){const id=next++;timers.set(id,{fn,delay});return id;}
   const timersApi={
-    set(fn,delay){const id=next++;timers.set(id,{fn,delay});return id;},
+    set:native,
     clear(id){timers.delete(id);},
   };
   const controller=autoRefresh({run:()=>runs++,busy:()=>engaged,isVisible:()=>shown,target,ms,timers:timersApi});
@@ -48,4 +50,17 @@ test('stop clears the timer and listeners; a stopped controller never reads agai
   x.controller.stop();
   assert.equal(x.timers.size,0);assert.equal(x.listeners.get('visibilitychange').length,0);assert.equal(x.listeners.get('focus').length,0);
   x.tick();x.fire('focus');x.controller.start();assert.equal(x.runs(),0);assert.equal(x.timers.size,0);
+});
+
+test('default timers survive the browser receiver check (window.setInterval semantics)',()=>{
+  const calls=[];
+  // Strict-mode host functions: a bare call sees `this === undefined`, a method call sees the receiver.
+  const sandbox={'use strict':undefined,
+    setInterval:function(fn,ms){'use strict';if(this!=null)throw new TypeError('Illegal invocation');calls.push('set '+ms);return 7;},
+    clearInterval:function(id){'use strict';if(this!=null)throw new TypeError('Illegal invocation');calls.push('clear '+id);}};
+  const m={exports:{}};vm.runInNewContext(fs.readFileSync(require.resolve('../client.js'),'utf8'),{module:m,...sandbox});
+  let ran=0;
+  const c=m.exports.autoRefresh({run:()=>ran++,busy:()=>false,isVisible:()=>true,target:null});
+  c.start();c.stop();
+  assert.deepEqual(calls,['set 10000','clear 7']);
 });

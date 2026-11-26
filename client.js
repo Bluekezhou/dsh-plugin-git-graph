@@ -123,7 +123,9 @@
   }
   // A visible pane re-reads on an interval and right after the window regains
   // focus. A read in flight is never overlapped or queued behind another.
-  function autoRefresh({run, busy, isVisible, target = null, ms = 10000, timers = {set: setInterval, clear: clearInterval}}) {
+  function autoRefresh({run, busy, isVisible, target = null, ms = 10000, // Browser timer functions reject a `this` other than window ("Illegal invocation"),
+    // so never call them as methods of this object.
+    timers = {set: (...a) => setInterval(...a), clear: (...a) => clearInterval(...a)}}) {
     let timer = null, stopped = false;
     const check = () => { if (!stopped && isVisible() && !busy()) run(); };
     const wake = () => check();
